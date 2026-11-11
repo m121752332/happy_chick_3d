@@ -23,6 +23,7 @@ import {
     director,
     input,
     primitives,
+    setDisplayStats,
     utils,
     view,
 } from 'cc';
@@ -384,6 +385,9 @@ export class FarmGame extends Component {
     private keyEggCooldown = 0;
     private readonly keys = new Set<string>();
     private volumePanel: Node | null = null;
+    private fpsButton: Node | null = null;
+    private fpsLabel: Label | null = null;
+    private fpsVisible = false;
     private sliderFills: Graphics[] = [];
     private unlockAudio = (): void => this.audio.unlock();
     private readonly screenPoint = new Vec3();
@@ -619,6 +623,7 @@ export class FarmGame extends Component {
         this.makeActionButton(this.overlay);
         this.buildResultsCurtain();
         this.buildVolumePanel();
+        this.buildFpsButton();
         this.toastLabel = this.makeLabel(this.uiRoot, 'Farm message', '', 25, new Color(255, 249, 218), 0, 0, 520, 52);
         this.toastLabel.node.active = false;
 
@@ -889,6 +894,7 @@ export class FarmGame extends Component {
         }
         this.hud?.setPosition(hudX, size.height / 2 - 82, 0);
         this.volumePanel?.setPosition(panelX, panelY, 0);
+        this.fpsButton?.setPosition(size.width / 2 - 66, -size.height / 2 + 30, 0);
         const overlayScale = Math.min(1, (size.width - 28) / 610, (size.height - 36) / 440);
         this.overlay?.setScale(overlayScale, overlayScale, 1);
         if (this.overlay) this.overlay.setPosition(0, 0, 0);
@@ -1115,6 +1121,20 @@ export class FarmGame extends Component {
         this.makeSlider(panel, '🔔 音效', -24, this.audio.sfxVolume, (v) => {
             this.audio.setVolumes(this.audio.musicVolume, v);
         }, () => this.audio.cluck());
+    }
+
+    /** Small corner button that shows or hides the engine's FPS / draw-call panel (hidden by default). */
+    private buildFpsButton (): void {
+        const button = this.makeButton(this.uiRoot!, 'FPS toggle', '', 0, 0, 104, 34, new Color(22, 50, 70, 200), new Color(255, 246, 210), 16, () => this.setFpsVisible(!this.fpsVisible));
+        this.fpsButton = button;
+        this.fpsLabel = button.getChildByName('Button title')!.getComponent(Label);
+        this.setFpsVisible(false);
+    }
+
+    private setFpsVisible (visible: boolean): void {
+        this.fpsVisible = visible;
+        setDisplayStats(visible);
+        if (this.fpsLabel) this.fpsLabel.string = visible ? '📊 FPS：開' : '📊 FPS：關';
     }
 
     private makeSlider (parent: Node, title: string, y: number, value: number, onChange: (v: number) => void, onRelease?: () => void): void {
@@ -1442,6 +1462,8 @@ export class FarmGame extends Component {
     private isOverUi (uiX: number, uiY: number): boolean {
         const size = view.getVisibleSize();
         if (uiY > size.height - 140) return true;
+        const fps = this.fpsButton;
+        if (fps && Math.abs(uiX - (fps.position.x + size.width / 2)) < 56 && Math.abs(uiY - (fps.position.y + size.height / 2)) < 22) return true;
         const panel = this.volumePanel;
         if (panel && panel.activeInHierarchy) {
             const x = panel.position.x + size.width / 2;
