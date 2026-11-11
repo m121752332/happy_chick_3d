@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>快樂小雞農場</title>
+  <meta name="viewport" content="width=device-width,user-scalable=no,initial-scale=1,minimum-scale=1,maximum-scale=1,minimal-ui=true">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="format-detection" content="telephone=no">
+  <meta name="renderer" content="webkit">
+  <meta name="force-rendering" content="webkit">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <meta name="msapplication-tap-highlight" content="no">
+  <meta name="full-screen" content="yes">
+  <meta name="x5-fullscreen" content="true">
+  <meta name="360-fullscreen" content="true">
+  <meta name="x5-page-mode" content="app">
+  <link rel="stylesheet" type="text/css" href="style.css">
+</head>
+<body>
+  <div id="GameDiv" cc_exact_fit_screen="true">
+    <div id="Cocos3dGameContainer">
+      <canvas id="GameCanvas" oncontextmenu="event.preventDefault()" tabindex="99"></canvas>
+    </div>
+  </div>
+  <script src="src/polyfills.bundle.js" charset="utf-8"></script>
+  <script src="src/system.bundle.js" charset="utf-8"></script>
+  <script src="src/import-map.json" type="systemjs-importmap" charset="utf-8"></script>
+  <script>
+    // Standard Creator boot, plus a fallback that mounts FarmGame if the scene was built without the component.
+    System.import('cc')
+      .then(function (cc) {
+        cc.director.once(cc.Director.EVENT_AFTER_SCENE_LAUNCH, function () {
+          var scene = cc.director.getScene();
+          if (!scene) return;
+          System.import('chunks:///_virtual/FarmGame.ts')
+            .then(function (gameModule) { gameModule.FarmGame.mount(scene); })
+            .catch(function (error) { console.error('[Happy Chick] Mount failed:', error); });
+        });
+        return System.import('./index.js');
+      })
+      .catch(function (error) { console.error('[Happy Chick] Startup failed:', error); });
+  </script>
+</body>
+</html>
