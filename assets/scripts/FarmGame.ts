@@ -25,6 +25,7 @@ import {
     director,
     input,
     primitives,
+    ResolutionPolicy,
     setDisplayStats,
     utils,
     view,
@@ -65,6 +66,18 @@ const FARM_HALF_X = 9.6;
 const FARM_HALF_Z = 6.4;
 const FENCE_X = FARM_HALF_X + 0.05;
 const FENCE_Z = FARM_HALF_Z + 0.2;
+/** Portrait (phone) mode: no fence, the whole screen is the farm. These tune the near-top-down camera. */
+const PORTRAIT_HALF_WIDTH = 5.2;
+const PORTRAIT_PITCH = 45;
+const PORTRAIT_NDC_BOTTOM = -0.9;
+const PORTRAIT_NDC_TOP = 0.15;
+const DESIGN_WIDTH_LANDSCAPE = 1280;
+const DESIGN_HEIGHT_LANDSCAPE = 720;
+const DESIGN_WIDTH_PORTRAIT = 640;
+const DESIGN_HEIGHT_PORTRAIT = 1136;
+
+/** Walkable ground: z range plus a half-width that can grow from front (maxZ) to back (minZ), so a perspective view fills a trapezoid. */
+interface FarmBounds { minX: number; maxX: number; minZ: number; maxZ: number; topHalfX: number; bottomHalfX: number }
 /** Eggs plus chicks allowed on the farm at once. */
 const MAX_CHICKS = 120;
 const CURTAIN_DROP_SECONDS = 0.9;
@@ -399,6 +412,16 @@ export class FarmGame extends Component {
     private mouseTarget: Vec3 | null = null;
     private bubbleRoot: Node | null = null;
     private bubbles: Bubble[] = [];
+    private portrait = false;
+    private layoutKey = '';
+    private bounds: FarmBounds = { minX: -FARM_HALF_X, maxX: FARM_HALF_X, minZ: -FARM_HALF_Z, maxZ: FARM_HALF_Z, topHalfX: FARM_HALF_X, bottomHalfX: FARM_HALF_X };
+    private portraitScenery: Node | null = null;
+    private fenceRoot: Node | null = null;
+    private cloudRoot: Node | null = null;
+    private portraitFlowers: Node | null = null;
+    private decor: { node: Node; x: number; z: number }[] = [];
+    private volumeScale = 1;
+    private bubbleBoost = 1;
     private heartRoot: Node | null = null;
     private hearts: FloatingHeart[] = [];
     private readonly lastSpoke = new Map<Node, number>();
@@ -406,6 +429,9 @@ export class FarmGame extends Component {
     private keyEggCooldown = 0;
     private readonly keys = new Set<string>();
     private volumePanel: Node | null = null;
+    private volumeBody: Node | null = null;
+    private volumeOpen = false;
+    private hudDrop = 0;
     private fpsButton: Node | null = null;
     private fpsLabel: Label | null = null;
     private fpsVisible = false;
@@ -453,7 +479,8 @@ export class FarmGame extends Component {
         input.on(Input.EventType.TOUCH_START, this.onPointerDown, this);
         input.on(Input.EventType.TOUCH_MOVE, this.onPointerMove, this);
         input.on(Input.EventType.MOUSE_MOVE, this.onPointerMove, this);
-        view.on('canvas-resize', this.layoutUI, this);
+        view.on('canvas-resize', this.onCanvasResize, this);
+        this.applyLayoutMode();
         this.layoutUI();
     }
 
@@ -474,7 +501,7 @@ export class FarmGame extends Component {
             document.removeEventListener('keydown', this.unlockAudio);
         }
         this.audio.stop();
-        view.off('canvas-resize', this.layoutUI, this);
+        view.off('canvas-resize', this.onCanvasResize, this);
         if (typeof document !== 'undefined' && this.customCursor) {
             document.body.style.cursor = '';
         }
@@ -514,19 +541,52 @@ export class FarmGame extends Component {
     private buildFarm (): void {
         const root = this.farmRoot!;
 
-        this.addBox(root, 'Soft Grass', 0, -0.18, -2, 40, 0.3, 30, '#77c66e');
-        this.addBox(root, 'Sunny Meadow', 0, 0.005, 0, FENCE_X * 2 - 0.3, 0.04, FENCE_Z * 2 - 0.3, '#8bd878');
-        this.addBox(root, 'Farm Path', 0, 0.03, FENCE_Z + 2.6, 2.1, 0.05, 5.0, '#dcb66d');
-        this.addBox(root, 'Barn Yard', -6.4, 0.03, -FENCE_Z - 2.3, 5.0, 0.04, 2.8, '#e4c77d');
-        this.buildFence(root);
-        this.buildBarn(root, -6.4, -FENCE_Z - 2.6);
-        this.buildTree(root, 6.6, -FENCE_Z - 2.4);
-        this.buildTree(root, 11.6, -3.2);
-        this.buildTree(root, -12.0, -1.0);
-        this.buildHay(root, FENCE_X + 1.9, 2.4);
-        this.buildHay(root, -FENCE_X - 1.9, 3.6);
+        this.addBox(root, 'Soft Grass', 0, -0.18, -20, 160, 0.3, 160, '#77c66e');
+        // Everything that belongs to the walled pen is grouped so phone mode can drop it in one go.
+        const fence = new Node('Fence and gate');
+        root.addChild(fence);
+        this.fenceRoot = fence;
+        this.addBox(fence, 'Sunny Meadow', 0, 0.005, 0, FENCE_X * 2 - 0.3, 0.04, FENCE_Z * 2 - 0.3, '#8bd878');
+        this.addBox(fence, 'Farm Path', 0, 0.03, FENCE_Z + 2.6, 2.1, 0.05, 5.0, '#dcb66d');
+        this.buildFence(fence);
+        // Scenery outside the pen; phone mode hides whatever would land on top of the playable screen.
+        this.addDecor(root, 'Barn', -6.4, -FENCE_Z - 2.6, (node) => {
+            this.addBox(node, 'Barn Yard', -6.4, 0.03, -FENCE_Z - 2.3, 5.0, 0.04, 2.8, '#e4c77d');
+            this.buildBarn(node, -6.4, -FENCE_Z - 2.6);
+        });
+        this.addDecor(root, 'Tree', 6.6, -FENCE_Z - 2.4, (node) => this.buildTree(node, 6.6, -FENCE_Z - 2.4));
+        this.addDecor(root, 'Tree', 11.6, -3.2, (node) => this.buildTree(node, 11.6, -3.2));
+        this.addDecor(root, 'Tree', -12.0, -1.0, (node) => this.buildTree(node, -12.0, -1.0));
+        this.addDecor(root, 'Hay', FENCE_X + 1.9, 2.4, (node) => this.buildHay(node, FENCE_X + 1.9, 2.4));
+        this.addDecor(root, 'Hay', -FENCE_X - 1.9, 3.6, (node) => this.buildHay(node, -FENCE_X - 1.9, 3.6));
         this.buildFlowers(root);
-        this.buildClouds(root);
+        this.buildPortraitFlowers(root);
+        const clouds = new Node('Clouds');
+        root.addChild(clouds);
+        this.cloudRoot = clouds;
+        this.buildClouds(clouds);
+    }
+
+    private addDecor (root: Node, name: string, x: number, z: number, build: (node: Node) => void): void {
+        const node = new Node(name);
+        root.addChild(node);
+        build(node);
+        this.decor.push({ node, x, z });
+    }
+
+    /** Extra flowers sprinkled over the playable area, only used in phone mode where the fence's grass is gone. */
+    private buildPortraitFlowers (root: Node): void {
+        const group = new Node('Phone flowers');
+        root.addChild(group);
+        this.portraitFlowers = group;
+        const colors = ['#f7f0dc', '#ffc858', '#ee7ca0', '#91d7f5'];
+        for (let i = 0; i < 46; i++) {
+            const x = -5.6 + Math.random() * 11.2;
+            const z = -13 + Math.random() * 26;
+            this.addCylinder(group, 'Flower stem', x, 0.16, z, 0.025, 0.32, '#4c9a4d');
+            this.addSphere(group, 'Flower', x, 0.35, z, 0.12, colors[i % colors.length]);
+        }
+        group.active = false;
     }
 
     private buildFence (root: Node): void {
@@ -565,6 +625,109 @@ export class FarmGame extends Component {
         this.addBox(root, 'Coop window', x - 0.72, 1.25, z + 1.09, 0.5, 0.42, 0.08, '#a9e9f5');
         this.addBox(root, 'Window crossbar', x - 0.72, 1.25, z + 1.15, 0.06, 0.48, 0.04, '#fff0bd');
         this.addBox(root, 'Window sill', x - 0.72, 1.25, z + 1.15, 0.54, 0.06, 0.04, '#fff0bd');
+    }
+
+    /** Phone scenery: a farmhouse at the back, a low fence in front of it, trees and hills behind; rebuilt whenever the walkable area changes. */
+    private rebuildPortraitScenery (portrait: boolean): void {
+        if (this.portraitScenery) {
+            this.portraitScenery.destroy();
+            this.portraitScenery = null;
+        }
+        if (!portrait || !this.farmRoot) return;
+        const root = new Node('Phone scenery');
+        this.farmRoot.addChild(root);
+        this.portraitScenery = root;
+        const b = this.bounds;
+        const back = b.minZ;
+        const wide = b.topHalfX + 6;
+        // Ground bands give the view depth: brighter meadow where chicks play, a dirt yard by the house, darker fields behind.
+        this.addBox(root, 'Play meadow', 0, 0.004, (b.minZ + b.maxZ) / 2 + 1, wide * 2, 0.03, b.maxZ - b.minZ + 4, '#8bd878');
+        this.addBox(root, 'House yard', 0, 0.01, back - 3.0, 9.5, 0.03, 5.0, '#e4c77d');
+        this.addBox(root, 'Yard path', 0, 0.015, back - 0.4, 1.5, 0.03, 1.8, '#dcb66d');
+        for (let i = 0; i < 4; i++) {
+            const z = back - 12 - i * 3.2;
+            this.addBox(root, 'Field row', 0, 0.01, z, wide * 2.4, 0.03, 1.5, i % 2 ? '#5fae5a' : '#6dbb5f');
+        }
+        this.addSphere(root, 'Hill', -14, -2.5, back - 30, 10, '#5aa457', [1.6, 0.7, 1]);
+        this.addSphere(root, 'Hill', 12, -3, back - 33, 11, '#4f9a50', [1.7, 0.75, 1]);
+        this.addSphere(root, 'Hill', 0, -4, back - 38, 12, '#66b35e', [2.2, 0.7, 1]);
+
+        // Low fence right behind the chicks' meadow, with a gap for the path to the door.
+        const fenceZ = back - 0.6;
+        const fenceHalf = b.topHalfX + 4;
+        for (let x = -fenceHalf; x <= fenceHalf + 0.01; x += 1.1) {
+            if (Math.abs(x) < 0.8) continue;
+            this.addBox(root, 'Low fence post', x, 0.32, fenceZ, 0.16, 0.64, 0.16, '#9b5a32');
+            this.addBox(root, 'Low fence cap', x, 0.66, fenceZ, 0.2, 0.06, 0.2, '#7a4526');
+        }
+        const railLength = fenceHalf - 0.8;
+        for (const y of [0.24, 0.5]) {
+            this.addBox(root, 'Low fence rail', -0.8 - railLength / 2, y, fenceZ, railLength, 0.1, 0.1, '#c68548');
+            this.addBox(root, 'Low fence rail', 0.8 + railLength / 2, y, fenceZ, railLength, 0.1, 0.1, '#c68548');
+        }
+
+        this.buildFarmhouse(root, 0, back - 4.6);
+        this.buildTree(root, -6.2, back - 3.4);
+        this.buildTree(root, 6.4, back - 4.2);
+        this.buildTree(root, -10.5, back - 7.5);
+        this.buildTree(root, 10.8, back - 8.5);
+        this.buildTree(root, -3.8, back - 10.5);
+        this.buildHay(root, 4.0, back - 2.2);
+        this.buildHay(root, -4.2, back - 1.9);
+        // A few flowers on the meadow and along the fence.
+        const colors = ['#f7f0dc', '#ffc858', '#ee7ca0', '#91d7f5'];
+        for (let i = 0; i < 34; i++) {
+            const z = b.minZ + Math.random() * (b.maxZ - b.minZ);
+            const half = this.halfXAt(z);
+            const x = -half + Math.random() * half * 2;
+            this.addCylinder(root, 'Flower stem', x, 0.12, z, 0.025, 0.24, '#4c9a4d');
+            this.addSphere(root, 'Flower', x, 0.27, z, 0.1, colors[i % colors.length]);
+        }
+        for (let i = 0; i < 16; i++) {
+            const x = -fenceHalf + Math.random() * fenceHalf * 2;
+            if (Math.abs(x) < 1.2) continue;
+            this.addSphere(root, 'Fence flower', x, 0.18, fenceZ - 0.35, 0.16, colors[(i + 1) % colors.length]);
+        }
+    }
+
+    /** Cream farmhouse with a red gable roof, facing the camera; darker side panels fake light on the unlit material. */
+    private buildFarmhouse (root: Node, x: number, z: number): void {
+        const w = 5.0;
+        const h = 2.8;
+        const d = 3.4;
+        this.addBox(root, 'House base', x, 0.08, z, w + 0.4, 0.16, d + 0.4, '#b9a58a');
+        this.addBox(root, 'House walls', x, h / 2 + 0.16, z, w, h, d, '#f4e4c6');
+        this.addBox(root, 'House side shade', x - w / 2 - 0.01, h / 2 + 0.16, z, 0.02, h, d, '#d8c4a2');
+        this.addBox(root, 'House side shade', x + w / 2 + 0.01, h / 2 + 0.16, z, 0.02, h, d, '#e2cfae');
+        // Gable: a triangle-ish front made of stacked slabs, then two sloped roof panels.
+        const slope = 32;
+        for (let i = 0; i < 5; i++) {
+            // Each step stays under the sloped roof so nothing pokes through it.
+            const gw = 2 * (w / 2 - 0.34 * (i + 1) / Math.tan(slope * Math.PI / 180));
+            if (gw < 0.2) break;
+            this.addBox(root, 'Gable', x, h + 0.16 + 0.17 + i * 0.34, z, gw, 0.34, d - 0.02, '#f4e4c6');
+        }
+        const panelLen = (w / 2 + 0.45) / Math.cos(slope * Math.PI / 180);
+        const roofY = h + 0.16 + 0.85;
+        const left = this.addBox(root, 'Roof left', x - (w / 4 + 0.1), roofY, z, panelLen, 0.22, d + 0.7, '#c4553d');
+        left.setRotationFromEuler(0, 0, slope);
+        const right = this.addBox(root, 'Roof right', x + (w / 4 + 0.1), roofY, z, panelLen, 0.22, d + 0.7, '#a94532');
+        right.setRotationFromEuler(0, 0, -slope);
+        this.addBox(root, 'Roof ridge', x, h + 0.16 + 1.62, z, 0.3, 0.2, d + 0.75, '#8c3727');
+        this.addBox(root, 'Chimney', x + 1.4, h + 1.9, z - 0.6, 0.5, 1.2, 0.5, '#9a6b52');
+        const front = z + d / 2 + 0.03;
+        this.addBox(root, 'Door frame', x, 0.86, front, 1.1, 1.5, 0.05, '#fff0bd');
+        this.addBox(root, 'Door', x, 0.82, front + 0.02, 0.9, 1.36, 0.05, '#8a4f2f');
+        this.addSphere(root, 'Door knob', x + 0.3, 0.8, front + 0.06, 0.06, '#ffd35c');
+        for (const wx of [-1.6, 1.6]) {
+            this.addBox(root, 'Window frame', x + wx, 1.75, front, 0.95, 0.85, 0.05, '#fff0bd');
+            this.addBox(root, 'Window', x + wx, 1.75, front + 0.02, 0.78, 0.68, 0.05, '#a9e9f5');
+            this.addBox(root, 'Window bar', x + wx, 1.75, front + 0.05, 0.06, 0.68, 0.03, '#fff0bd');
+            this.addBox(root, 'Window box', x + wx, 1.25, front + 0.1, 1.0, 0.18, 0.22, '#9b5a32');
+            for (const fx of [-0.3, 0, 0.3]) this.addSphere(root, 'Window flower', x + wx + fx, 1.4, front + 0.12, 0.1, fx === 0 ? '#ffc858' : '#ee7ca0');
+        }
+        this.addBox(root, 'Door step', x, 0.2, front + 0.35, 1.4, 0.12, 0.6, '#c9b48f');
+        this.addBox(root, 'Gable window', x, h + 0.9, front - 0.01, 0.6, 0.5, 0.05, '#a9e9f5');
     }
 
     private buildTree (root: Node, x: number, z: number): void {
@@ -838,6 +1001,7 @@ export class FarmGame extends Component {
         this.resultPanel!.active = false;
         this.creditsPanel!.active = true;
         this.state = 'credits';
+        if (this.volumePanel) this.volumePanel.active = false;
         const height = view.getVisibleSize().height;
         this.creditsScroll!.setPosition(0, -height / 2, 0);
     }
@@ -845,6 +1009,7 @@ export class FarmGame extends Component {
     private onHideCredits (): void {
         this.creditsPanel!.active = false;
         this.resultPanel!.active = true;
+        if (this.volumePanel) this.volumePanel.active = true;
         this.state = 'ended';
     }
 
@@ -897,6 +1062,113 @@ export class FarmGame extends Component {
         return label;
     }
 
+    private onCanvasResize (): void {
+        this.applyLayoutMode();
+        this.layoutUI();
+    }
+
+    /** Landscape keeps the fenced pen; portrait (phones) drops the fence so the whole screen is the farm. */
+    private applyLayoutMode (): void {
+        const canvas = view.getCanvasSize();
+        if (canvas.width <= 0 || canvas.height <= 0 || !this.camera) return;
+        const portrait = canvas.height > canvas.width;
+        const key = portrait ? `p${canvas.width.toFixed(0)}x${canvas.height.toFixed(0)}` : 'l';
+        if (key === this.layoutKey) return;
+        const modeChanged = portrait !== this.portrait || this.layoutKey === '';
+        this.layoutKey = key;
+        this.portrait = portrait;
+
+        if (modeChanged) {
+            // Fixed width keeps UI sizes predictable: 1280 wide on desktop, 640 wide on a phone held upright.
+            if (portrait) view.setDesignResolutionSize(DESIGN_WIDTH_PORTRAIT, DESIGN_HEIGHT_PORTRAIT, ResolutionPolicy.FIXED_WIDTH);
+            else view.setDesignResolutionSize(DESIGN_WIDTH_LANDSCAPE, DESIGN_HEIGHT_LANDSCAPE, ResolutionPolicy.FIXED_WIDTH);
+        }
+        this.volumeScale = portrait ? 1.3 : 1;
+        this.bubbleBoost = portrait ? 1.35 : 1;
+        if (this.fenceRoot) this.fenceRoot.active = !portrait;
+        if (this.cloudRoot) this.cloudRoot.active = !portrait;
+
+        if (!portrait) {
+            this.camera.node.setPosition(0, 19, 16.5);
+            this.camera.node.setRotationFromEuler(-48, 0, 0);
+            this.bounds = { minX: -FARM_HALF_X, maxX: FARM_HALF_X, minZ: -FARM_HALF_Z, maxZ: FARM_HALF_Z, topHalfX: FARM_HALF_X, bottomHalfX: FARM_HALF_X };
+        } else {
+            this.setupPortraitCamera(canvas.width / canvas.height);
+        }
+        if (this.portraitFlowers) this.portraitFlowers.active = false;
+        for (const item of this.decor) item.node.active = !portrait;
+        this.rebuildPortraitScenery(portrait);
+        this.clampToBounds();
+        if (this.detailLabel && this.state === 'ready') this.detailLabel.string = this.introText();
+        if (this.hintLabel && this.state === 'playing') this.hintLabel.string = this.hintText();
+    }
+
+    /** Near top-down camera sized so about 9.6 world units span the phone's width; derives the playable rectangle from what the screen shows. */
+    private setupPortraitCamera (aspect: number): void {
+        const cam = this.camera!;
+        const fov = (cam.fov || 45) * Math.PI / 180;
+        const ty = Math.tan(fov / 2);
+        const tx = ty * aspect;
+        const pitch = PORTRAIT_PITCH * Math.PI / 180;
+        const sin = Math.sin(pitch);
+        const cos = Math.cos(pitch);
+        const factor = (ny: number): number => sin - ny * ty * cos;
+        const height = PORTRAIT_HALF_WIDTH / tx * factor(PORTRAIT_NDC_BOTTOM);
+        const tBottom = height / factor(PORTRAIT_NDC_BOTTOM);
+        const tTop = height / factor(PORTRAIT_NDC_TOP);
+        const zBottom = (-cos - PORTRAIT_NDC_BOTTOM * ty * sin) * tBottom;
+        const zTop = (-cos - PORTRAIT_NDC_TOP * ty * sin) * tTop;
+        const camZ = -(zBottom + zTop) / 2;
+        cam.node.setPosition(0, height, camZ);
+        cam.node.setRotationFromEuler(-PORTRAIT_PITCH, 0, 0);
+        const bottomHalfX = tx * tBottom - 0.3;
+        const topHalfX = tx * tTop - 0.3;
+        const halfWidth = Math.max(bottomHalfX, topHalfX);
+        this.bounds = { minX: -halfWidth, maxX: halfWidth, minZ: camZ + zTop, maxZ: camZ + zBottom, topHalfX, bottomHalfX };
+    }
+
+    /** Half-width of the walkable ground at depth z (wider toward the back in the phone's perspective view). */
+    private halfXAt (z: number): number {
+        const b = this.bounds;
+        const t = Math.max(0, Math.min(1, (b.maxZ - z) / Math.max(0.001, b.maxZ - b.minZ)));
+        return b.bottomHalfX + (b.topHalfX - b.bottomHalfX) * t;
+    }
+
+    private clampZ (z: number, margin: number): number {
+        return Math.max(this.bounds.minZ + margin, Math.min(this.bounds.maxZ - margin, z));
+    }
+
+    private clampX (x: number, z: number, margin: number): number {
+        const h = this.halfXAt(z) - margin;
+        return Math.max(-h, Math.min(h, x));
+    }
+
+    private clampToBounds (): void {
+        const clamp = (n: Node, margin: number): void => {
+            const p = n.position;
+            const z = this.clampZ(p.z, margin * 0.85);
+            n.setPosition(this.clampX(p.x, z, margin), p.y, z);
+        };
+        this.chicks.forEach((chick) => clamp(chick.node, 0.65));
+        this.eggs.forEach((egg) => {
+            clamp(egg.node, 0.6);
+            egg.x = egg.node.position.x;
+            egg.z = egg.node.position.z;
+        });
+        if (this.hen) clamp(this.hen, 0.7);
+        this.mouseTarget = null;
+    }
+
+    private introText (): string {
+        return this.portrait
+            ? '30 秒內孵出更多小雞！\n點螢幕任何地方下蛋，3 秒後自動孵化。'
+            : '30 秒內孵出更多小雞！\n滑鼠點農場，或 WASD 移動＋空白鍵下蛋';
+    }
+
+    private hintText (): string {
+        return this.portrait ? '點螢幕下蛋　•　拖曳移動母雞　•　每隻 100 分' : '點草地／空白鍵下蛋　•　WASD 移動母雞　•　每隻 100 分';
+    }
+
     private layoutUI (): void {
         if (!this.uiRoot) return;
         const size = view.getVisibleSize();
@@ -907,27 +1179,35 @@ export class FarmGame extends Component {
         const hudScale = Math.min(1, (size.width - 24) / 560);
         this.hud?.setScale(hudScale, hudScale, 1);
         // Volume panel sits top-right; slide the HUD left so they never overlap, or drop the panel below it on narrow screens.
-        const panelX = size.width / 2 - 175;
-        let panelY = size.height / 2 - 62;
+        const vs = this.volumeScale;
+        this.volumePanel?.setScale(vs, vs, 1);
+        const iconHalf = 28 * vs;
+        const panelX = size.width / 2 - iconHalf - 10;
+        const panelY = size.height / 2 - iconHalf - 10;
         const hudHalf = 280 * hudScale;
         let hudX = 0;
-        if (hudX + hudHalf > panelX - 175) hudX = panelX - 175 - hudHalf;
+        this.hudDrop = 0;
+        if (hudX + hudHalf > panelX - iconHalf - 10) hudX = panelX - iconHalf - 10 - hudHalf;
         if (hudX - hudHalf < -size.width / 2 + 10) {
             hudX = 0;
-            panelY = size.height / 2 - 82 - 54 * hudScale - 66;
+            this.hudDrop = 2 * iconHalf + 6;
         }
-        this.hud?.setPosition(hudX, size.height / 2 - 82, 0);
+        this.hud?.setPosition(hudX, size.height / 2 - 82 - this.hudDrop, 0);
         this.volumePanel?.setPosition(panelX, panelY, 0);
-        this.fpsButton?.setPosition(size.width / 2 - 66, -size.height / 2 + 30, 0);
+        const fs = this.portrait ? 1.5 : 1;
+        this.fpsButton?.setScale(fs, fs, 1);
+        this.fpsButton?.setPosition(size.width / 2 - 66 * fs + 12 * (fs - 1), -size.height / 2 + 30 * fs, 0);
         const overlayScale = Math.min(1, (size.width - 28) / 610, (size.height - 36) / 440);
         this.overlay?.setScale(overlayScale, overlayScale, 1);
         if (this.overlay) this.overlay.setPosition(0, 0, 0);
         this.drawCurtain(size.width, size.height);
         const resultScale = Math.min(1, (size.width - 28) / 760, (size.height - 60) / 560);
         this.resultPanel?.setScale(resultScale, resultScale, 1);
-        const creditScale = Math.min(1, (size.width - 28) / 900);
+        const creditScale = this.portrait ? Math.min(1.2, (size.width - 28) / 520) : Math.min(1, (size.width - 28) / 900);
         this.creditsPanel?.setScale(creditScale, creditScale, 1);
-        this.creditsBack?.setPosition(-(size.width / 2) / creditScale + 150, (size.height / 2) / creditScale - 125, 0);
+        // Landscape: top-left. Portrait: bottom-centre, because the volume panel already fills the top on a narrow screen.
+        if (this.portrait) this.creditsBack?.setPosition(0, -(size.height / 2) / creditScale + 120, 0);
+        else this.creditsBack?.setPosition(-(size.width / 2) / creditScale + 150, (size.height / 2) / creditScale - 125, 0);
         this.refreshHud();
     }
 
@@ -952,11 +1232,11 @@ export class FarmGame extends Component {
         this.currentCursor = '';
         this.keys.clear();
         this.mouseTarget = null;
-        this.hen?.setPosition(0, 0, 2);
+        this.hen?.setPosition(0, 0, Math.max(this.bounds.minZ + 1, Math.min(this.bounds.maxZ - 1, 2)));
         this.hen?.setRotationFromEuler(0, 0, 0);
         // The hen is always on the farm so keyboard players can see who they move.
         this.setHenVisible(true);
-        this.hintLabel!.string = '點草地／空白鍵下蛋　•　WASD 移動母雞　•　每隻 100 分';
+        this.hintLabel!.string = this.hintText();
         this.refreshHud();
     }
 
@@ -985,6 +1265,7 @@ export class FarmGame extends Component {
         this.resultScore!.string = `⭐ 農場總分　${this.score} 分`;
         this.resultPanel!.active = true;
         this.creditsPanel!.active = false;
+        if (this.volumePanel) this.volumePanel.active = true;
         const curtain = this.curtain!;
         curtain.active = true;
         const height = view.getVisibleSize().height;
@@ -1068,8 +1349,8 @@ export class FarmGame extends Component {
         const p = this.hen.position;
         // Lay just behind the hen so she doesn't stand on the egg.
         const angle = this.hen.eulerAngles.y * Math.PI / 180;
-        const x = Math.max(-FARM_HALF_X + 0.6, Math.min(FARM_HALF_X - 0.6, p.x - Math.sin(angle) * 0.9));
-        const z = Math.max(-FARM_HALF_Z + 0.5, Math.min(FARM_HALF_Z - 0.5, p.z - Math.cos(angle) * 0.9));
+        const z = this.clampZ(p.z - Math.cos(angle) * 0.9, 0.5);
+        const x = this.clampX(p.x - Math.sin(angle) * 0.9, z, 0.6);
         this.layEgg(x, z);
         this.henPhase = 0;
     }
@@ -1101,8 +1382,8 @@ export class FarmGame extends Component {
         const moving = dx !== 0 || dz !== 0;
         if (moving) {
             const length = Math.sqrt(dx * dx + dz * dz);
-            const x = Math.max(-FARM_HALF_X + 0.7, Math.min(FARM_HALF_X - 0.7, p.x + dx / length * step));
-            const z = Math.max(-FARM_HALF_Z + 0.6, Math.min(FARM_HALF_Z - 0.6, p.z + dz / length * step));
+            const z = this.clampZ(p.z + dz / length * step, 0.6);
+            const x = this.clampX(p.x + dx / length * step, z, 0.7);
             this.hen.setPosition(x, 0, z);
             if (length > 0.05) this.hen.setRotationFromEuler(0, Math.atan2(dx, dz) * 180 / Math.PI, 0);
             this.henPhase += deltaTime * 14;
@@ -1135,17 +1416,45 @@ export class FarmGame extends Component {
         this.hen = hen;
     }
 
-    /** Two draggable bars for music and sound-effect volume, always in the bottom-right corner. */
+    /** Round music-note icon in the top-right corner; tapping it opens or closes the music / sound-effect sliders. */
     private buildVolumePanel (): void {
         const panel = new Node('Volume panel');
         this.uiRoot!.addChild(panel);
         this.volumePanel = panel;
-        this.drawPanel(panel, 0, 0, 330, 104, new Color(22, 50, 70, 215), 20);
+        const icon = this.makeButton(panel, 'Volume icon', '', 0, 0, 56, 56, new Color(22, 50, 70, 225), new Color(255, 246, 210), 20, () => this.setVolumeOpen(!this.volumeOpen));
+        const note = new Node('Music note');
+        icon.addChild(note);
+        const g = note.addComponent(Graphics);
+        g.fillColor = new Color(255, 214, 102);
+        g.strokeColor = new Color(255, 214, 102);
+        g.lineWidth = 4;
+        g.ellipse(-6, -11, 7.5, 5.5);
+        g.fill();
+        g.ellipse(9, -6, 7.5, 5.5);
+        g.fill();
+        g.moveTo(0.5, -10);
+        g.lineTo(0.5, 12);
+        g.lineTo(15, 9);
+        g.lineTo(15, -5);
+        g.stroke();
+        g.rect(0.5, 8, 14.5, 4);
+        g.fill();
+        const body = new Node('Volume body');
+        panel.addChild(body);
+        this.volumeBody = body;
+        body.setPosition(28 - 165, -(28 + 10 + 52), 0);
+        this.drawPanel(body, 0, 0, 330, 104, new Color(22, 50, 70, 225), 20);
         this.sliderFills = [];
-        this.makeSlider(panel, '🎵 音樂', 22, this.audio.musicVolume, (v) => this.audio.setVolumes(v, this.audio.sfxVolume));
-        this.makeSlider(panel, '🔔 音效', -24, this.audio.sfxVolume, (v) => {
+        this.makeSlider(body, '🎵 音樂', 22, this.audio.musicVolume, (v) => this.audio.setVolumes(v, this.audio.sfxVolume));
+        this.makeSlider(body, '🔔 音效', -24, this.audio.sfxVolume, (v) => {
             this.audio.setVolumes(this.audio.musicVolume, v);
         }, () => this.audio.cluck());
+        this.setVolumeOpen(false);
+    }
+
+    private setVolumeOpen (open: boolean): void {
+        this.volumeOpen = open;
+        if (this.volumeBody) this.volumeBody.active = open;
     }
 
     /** Small corner button that shows or hides the engine's FPS / draw-call panel (hidden by default). */
@@ -1212,7 +1521,13 @@ export class FarmGame extends Component {
         if (distance < 0) return null;
         const worldX = ray.o.x + ray.d.x * distance;
         const worldZ = ray.o.z + ray.d.z * distance;
-        if (Math.abs(worldX) > FARM_HALF_X - 0.5 || Math.abs(worldZ) > FARM_HALF_Z - 0.45) return null;
+        const b = this.bounds;
+        if (this.portrait) {
+            // Phone: the whole screen is the farm, so a tap near the edge still lands on the grass.
+            const z = this.clampZ(worldZ, 0.4);
+            return new Vec3(this.clampX(worldX, z, 0.4), 0.15, z);
+        }
+        if (worldX < b.minX + 0.5 || worldX > b.maxX - 0.5 || worldZ < b.minZ + 0.45 || worldZ > b.maxZ - 0.45) return null;
         return new Vec3(worldX, 0.15, worldZ);
     }
 
@@ -1331,9 +1646,9 @@ export class FarmGame extends Component {
             chick.action = 'bump';
             const side = Math.floor(Math.random() * 4);
             chick.target.set(
-                side === 0 ? FARM_HALF_X - 0.7 : side === 1 ? -FARM_HALF_X + 0.7 : chick.node.position.x,
+                side === 0 ? this.halfXAt(chick.node.position.z) - 0.7 : side === 1 ? -this.halfXAt(chick.node.position.z) + 0.7 : chick.node.position.x,
                 0.12,
-                side === 2 ? FARM_HALF_Z - 0.6 : side === 3 ? -FARM_HALF_Z + 0.6 : chick.node.position.z,
+                side === 2 ? this.bounds.maxZ - 0.6 : side === 3 ? this.bounds.minZ + 0.6 : chick.node.position.z,
             );
             chick.actionTime = 4;
         } else if (roll < 0.67 && this.chicks.length > 1) {
@@ -1367,11 +1682,9 @@ export class FarmGame extends Component {
     }
 
     private setRandomTarget (chick: Chick): void {
-        chick.target.set(
-            -FARM_HALF_X + 1 + Math.random() * (FARM_HALF_X * 2 - 2),
-            0.12,
-            -FARM_HALF_Z + 0.8 + Math.random() * (FARM_HALF_Z * 2 - 1.6),
-        );
+        const targetZ = this.bounds.minZ + 0.8 + Math.random() * (this.bounds.maxZ - this.bounds.minZ - 1.6);
+        const targetHalf = this.halfXAt(targetZ) - 1;
+        chick.target.set(-targetHalf + Math.random() * targetHalf * 2, 0.12, targetZ);
     }
 
     private moveChick (chick: Chick, deltaTime: number): void {
@@ -1402,8 +1715,8 @@ export class FarmGame extends Component {
             }
         } else {
             const step = Math.min(distance, chick.speed * deltaTime * (chick.action === 'bump' ? 1.4 : 1));
-            const nextX = Math.max(-FARM_HALF_X + 0.65, Math.min(FARM_HALF_X - 0.65, position.x + dx / distance * step));
-            const nextZ = Math.max(-FARM_HALF_Z + 0.55, Math.min(FARM_HALF_Z - 0.55, position.z + dz / distance * step));
+            const nextZ = this.clampZ(position.z + dz / distance * step, 0.55);
+            const nextX = this.clampX(position.x + dx / distance * step, nextZ, 0.65);
             chick.node.setPosition(nextX, position.y, nextZ);
             chick.node.setRotationFromEuler(0, Math.atan2(dx, dz) * 180 / Math.PI, 0);
         }
@@ -1486,14 +1799,17 @@ export class FarmGame extends Component {
     /** True when a UI-space point (origin bottom-left) is on the HUD strip or the volume panel. */
     private isOverUi (uiX: number, uiY: number): boolean {
         const size = view.getVisibleSize();
-        if (uiY > size.height - 140) return true;
+        if (uiY > size.height - 140 - this.hudDrop) return true;
         const fps = this.fpsButton;
-        if (fps && Math.abs(uiX - (fps.position.x + size.width / 2)) < 56 && Math.abs(uiY - (fps.position.y + size.height / 2)) < 22) return true;
+        const fpsScale = fps ? fps.scale.x : 1;
+        if (fps && Math.abs(uiX - (fps.position.x + size.width / 2)) < 56 * fpsScale && Math.abs(uiY - (fps.position.y + size.height / 2)) < 22 * fpsScale) return true;
         const panel = this.volumePanel;
         if (panel && panel.activeInHierarchy) {
             const x = panel.position.x + size.width / 2;
             const y = panel.position.y + size.height / 2;
-            if (Math.abs(uiX - x) < 175 && Math.abs(uiY - y) < 62) return true;
+            const vs = this.volumeScale;
+            if (Math.abs(uiX - x) < 34 * vs && Math.abs(uiY - y) < 34 * vs) return true;
+            if (this.volumeOpen && Math.abs(uiX - (x - 137 * vs)) < 175 * vs && Math.abs(uiY - (y - 90 * vs)) < 62 * vs) return true;
         }
         return false;
     }
@@ -1645,7 +1961,7 @@ export class FarmGame extends Component {
             this.placeBubble(bubble);
             // Pop in, then fade out over the last moment.
             const scale = Math.min(1, 0.6 + (1.8 - Math.min(1.8, bubble.time)) * 3);
-            bubble.node.setScale(scale, scale, 1);
+            bubble.node.setScale(scale * this.bubbleBoost, scale * this.bubbleBoost, 1);
         }
         // Stack bubbles that would cover each other, so every chick's line stays readable.
         const placed = this.bubbles.slice().sort((a, b) => a.node.position.y - b.node.position.y);
@@ -1654,7 +1970,8 @@ export class FarmGame extends Component {
             let y = a.y;
             for (let j = 0; j < i; j++) {
                 const b = placed[j].node.position;
-                if (Math.abs(a.x - b.x) < (placed[i].width + placed[j].width) / 2 && Math.abs(y - b.y) < 40) y = b.y + 40;
+                const boost = this.bubbleBoost;
+                if (Math.abs(a.x - b.x) < (placed[i].width + placed[j].width) / 2 * boost && Math.abs(y - b.y) < 40 * boost) y = b.y + 40 * boost;
             }
             if (y !== a.y) placed[i].node.setPosition(a.x, y, 0);
         }
