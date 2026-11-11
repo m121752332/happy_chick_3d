@@ -13,6 +13,7 @@ import {
     Input,
     KeyCode,
     Label,
+    LabelOutline,
     Layers,
     Material,
     Mesh,
@@ -20,6 +21,7 @@ import {
     Node,
     Vec3,
     UITransform,
+    UIOpacity,
     director,
     input,
     primitives,
@@ -97,6 +99,20 @@ interface Bubble {
     time: number;
 }
 
+interface FloatingHeart {
+    node: Node;
+    opacity: UIOpacity;
+    age: number;
+    life: number;
+    startX: number;
+    startY: number;
+    rise: number;
+    swayAmp: number;
+    swaySpeed: number;
+    swayPhase: number;
+    size: number;
+}
+
 interface UiAnimation {
     node: Node;
     fromY: number;
@@ -132,6 +148,9 @@ const CC_KEY_NAMES: Record<number, string> = {
 const KEY_EGG_COOLDOWN = 0.15;
 const HEN_FOLLOW_SPEED = 24;
 const MAX_BUBBLES = 8;
+const MAX_HEARTS = 40;
+const SCORE_FLOAT_TEXT = `孵化成功 +${POINTS_PER_CHICK}`;
+const SCORE_FLOAT_COLORS = ['#ffffff', '#fff2a8', '#ffd6e8', '#c9f4ff', '#d9ffc9'];
 /** Each chick says at most one line in this many seconds. */
 const CHICK_TALK_GAP = 10;
 /** Things chicks say on their own, picked at random. */
@@ -380,6 +399,8 @@ export class FarmGame extends Component {
     private mouseTarget: Vec3 | null = null;
     private bubbleRoot: Node | null = null;
     private bubbles: Bubble[] = [];
+    private heartRoot: Node | null = null;
+    private hearts: FloatingHeart[] = [];
     private readonly lastSpoke = new Map<Node, number>();
     private readonly bubblePoint = new Vec3();
     private keyEggCooldown = 0;
@@ -470,6 +491,7 @@ export class FarmGame extends Component {
         this.updateChicks(deltaTime);
         this.updateHen(deltaTime);
         this.updateBubbles(deltaTime);
+        this.updateHearts(deltaTime);
         this.refreshHud();
 
         if (this.secondsLeft <= 0) this.endRound();
@@ -603,6 +625,8 @@ export class FarmGame extends Component {
 
         this.bubbleRoot = new Node('Speech bubbles');
         this.uiRoot.addChild(this.bubbleRoot);
+        this.heartRoot = new Node('Floating hearts');
+        this.uiRoot.addChild(this.heartRoot);
         this.hud = new Node('HUD');
         this.uiRoot.addChild(this.hud);
         this.drawPanel(this.hud, 0, 0, 560, 108, new Color(29, 79, 75, 230), 24);
@@ -953,6 +977,7 @@ export class FarmGame extends Component {
         this.hud!.active = false;
         this.hideToast();
         this.clearBubbles();
+        this.clearHearts();
         this.updateCursor(0, 0);
         if (this.hen) this.hen.active = false;
         this.resultTitle!.string = '時間到！';
@@ -1213,7 +1238,7 @@ export class FarmGame extends Component {
                 this.say(chick.node, HATCH_LINES[Math.floor(Math.random() * HATCH_LINES.length)], 1.5, 1.8);
                 this.hatched += 1;
                 this.score += POINTS_PER_CHICK;
-                this.showToast(`啵！孵化成功 +${POINTS_PER_CHICK} 分`);
+                this.floatHeart();
                 this.audio.chirp();
             }
         }
@@ -1478,6 +1503,67 @@ export class FarmGame extends Component {
         this.customCursor = 'none';
         this.handCursor = this.buildHandCursorSvg();
         this.updateCursor(0, 0);
+    }
+
+    /** Live-stream style "+100": the hatch message itself floats up from the bottom-right corner, sways, and slowly fades away. */
+    private floatHeart (): void {
+        if (!this.heartRoot) return;
+        if (this.hearts.length >= MAX_HEARTS) this.removeHeart(this.hearts[0]);
+        const size = view.getVisibleSize();
+        const fontSize = 28 + Math.random() * 8;
+        const node = new Node('Hatch score');
+        node.layer = Layers.Enum.UI_2D;
+        this.heartRoot.addChild(node);
+        node.addComponent(UITransform).setContentSize(260, fontSize * 1.5);
+        const opacity = node.addComponent(UIOpacity);
+        const label = node.addComponent(Label);
+        label.useSystemFont = true;
+        label.fontFamily = 'Arial';
+        label.fontSize = fontSize;
+        label.lineHeight = Math.round(fontSize * 1.3);
+        label.isBold = true;
+        label.color = new Color(SCORE_FLOAT_COLORS[Math.floor(Math.random() * SCORE_FLOAT_COLORS.length)]);
+        label.string = SCORE_FLOAT_TEXT;
+        const outline = node.addComponent(LabelOutline);
+        outline.color = new Color(40, 90, 60, 255);
+        outline.width = 3;
+        // Right-aligned lane near the edge; each one drifts a little differently like a live-stream reaction.
+        const startX = size.width / 2 - 150 - Math.random() * 40;
+        const startY = -size.height / 2 + 90;
+        node.setPosition(startX, startY, 0);
+        node.setScale(0, 0, 1);
+        this.hearts.push({
+            node, opacity, age: 0, life: 3.4 + Math.random() * 1.2, startX, startY,
+            rise: Math.min(size.height * 0.7, 520), swayAmp: 14 + Math.random() * 22,
+            swaySpeed: 2 + Math.random() * 1.5, swayPhase: Math.random() * Math.PI * 2, size: fontSize,
+        });
+    }
+
+    private updateHearts (deltaTime: number): void {
+        for (const heart of this.hearts.slice()) {
+            heart.age += deltaTime;
+            const t = heart.age / heart.life;
+            if (t >= 1) {
+                this.removeHeart(heart);
+                continue;
+            }
+            const rise = 1 - Math.pow(1 - t, 1.6);
+            const x = heart.startX + Math.sin(heart.age * heart.swaySpeed + heart.swayPhase) * heart.swayAmp * Math.min(1, t * 3) - rise * 20;
+            heart.node.setPosition(x, heart.startY + rise * heart.rise, 0);
+            const pop = Math.min(1, heart.age / 0.25);
+            const scale = (1.25 - 0.25 * pop) * pop;
+            heart.node.setScale(scale, scale, 1);
+            heart.opacity.opacity = t < 0.5 ? 255 : Math.max(0, 255 * (1 - (t - 0.5) / 0.5));
+        }
+    }
+
+    private removeHeart (heart: FloatingHeart): void {
+        heart.node.destroy();
+        this.hearts.splice(this.hearts.indexOf(heart), 1);
+    }
+
+    private clearHearts (): void {
+        this.hearts.slice().forEach((heart) => this.removeHeart(heart));
     }
 
     /** Pop a speech cloud over a chick (or the hen) that follows it around the farm. */
