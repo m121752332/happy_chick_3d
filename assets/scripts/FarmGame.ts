@@ -160,7 +160,6 @@ const KEY_EGG_COOLDOWN = 0.15;
 const HEN_FOLLOW_SPEED = 24;
 const MAX_BUBBLES = 8;
 const MAX_HEARTS = 40;
-const SCORE_FLOAT_TEXT = `孵化成功 +${POINTS_PER_CHICK}`;
 const SCORE_FLOAT_COLORS = ['#ffffff', '#fff2a8', '#ffd6e8', '#c9f4ff', '#d9ffc9'];
 /** Each chick says at most one line in this many seconds. */
 const CHICK_TALK_GAP = 10;
@@ -625,7 +624,7 @@ class LadderOverlay {
         const first = !current;
         const root = this.mount(`
 <h2>${first ? '歡迎來到快樂小雞農場！' : '修改名字'}</h2>
-<p class="hc-sub">幫自己取個名字，上天梯排行榜用（中文最多 6 個字）</p>
+<p class="hc-sub">取個名字，上天梯排行榜用<br>最多 6 個中文字或 12 個英文字母</p>
 <div class="hc-row"><input class="hc-input" maxlength="40" placeholder="輸入名字…"><button class="hc-btn alt" data-act="dice" title="隨機名字">🎲</button></div>
 <div class="hc-preview"></div>
 <div class="hc-actions">${first ? '' : '<button class="hc-btn ghost" data-act="cancel">取消</button>'}<button class="hc-btn" data-act="ok">確定</button></div>`);
@@ -678,7 +677,7 @@ class LadderOverlay {
         const status = myRank > 0 ? `你目前第 ${myRank} 名` : '本週還沒有你的成績，玩一局就上榜！';
         const root = this.mount(`
 <h2>🏆 本週天梯</h2>
-<p class="hc-sub">每週一早上 6:00 重新排名，距離刷新還有 ${countdown}<br>${me ? escapeHtml(me.name) + '，' : ''}${escapeHtml(status)}</p>
+<p class="hc-sub">每週一早上 6:00 重新排名<br>距離刷新還有 ${countdown}<br>${me ? escapeHtml(me.name) + '，' : ''}${escapeHtml(status)}</p>
 <div class="hc-list">${shown.length ? shown.map((e, i) => row(e, rankOf(e, i))).join('') : '<div class="hc-empty">本週還沒有人上榜</div>'}</div>
 ${mineRow}
 <div class="hc-actions"><button class="hc-btn ghost" data-act="rename">✏️ 改名</button><button class="hc-btn" data-act="close">關閉</button></div>
@@ -753,6 +752,11 @@ export class FarmGame extends Component {
     private bubbleBoost = 1;
     private heartRoot: Node | null = null;
     private hearts: FloatingHeart[] = [];
+    private pendingFloats = 0;
+    private floatCooldown = 0;
+    private volumeBodyY = -90;
+    private replayButton: Node | null = null;
+    private creditsButton: Node | null = null;
     private readonly lastSpoke = new Map<Node, number>();
     private readonly bubblePoint = new Vec3();
     private keyEggCooldown = 0;
@@ -1241,9 +1245,9 @@ export class FarmGame extends Component {
         this.makeHenBadge(badge, 1.1);
         this.resultHatched = this.makeLabel(results, 'Result hatched', '', 36, new Color(255, 243, 200), 0, -40, 700, 52);
         this.resultScore = this.makeLabel(results, 'Result score', '', 36, new Color(255, 243, 200), 0, -92, 700, 52);
-        this.resultRank = this.makeLabel(results, 'Result rank', '', 26, new Color(255, 214, 102), 0, -128, 700, 36);
-        this.makeButton(results, 'Replay button', '再玩一次　▶', -185, -210, 340, 104, new Color(255, 205, 74), new Color(91, 57, 31), 36, this.onReplay);
-        this.makeButton(results, 'Credits button', '製作團隊　🎬', 185, -210, 340, 104, new Color(120, 205, 235), new Color(20, 52, 74), 36, this.onShowCredits);
+        this.resultRank = this.makeLabel(results, 'Result rank', '', 28, new Color(255, 214, 102), 0, -142, 700, 40);
+        this.replayButton = this.makeButton(results, 'Replay button', '再玩一次　▶', -185, -236, 340, 104, new Color(255, 205, 74), new Color(91, 57, 31), 36, this.onReplay);
+        this.creditsButton = this.makeButton(results, 'Credits button', '製作團隊　🎬', 185, -236, 340, 104, new Color(120, 205, 235), new Color(20, 52, 74), 36, this.onShowCredits);
 
         const credits = new Node('Credits');
         curtain.addChild(credits);
@@ -1260,7 +1264,7 @@ export class FarmGame extends Component {
             y -= size * 1.9;
         }
         this.creditsHeight = -y;
-        this.creditsBack = this.makeButton(credits, 'Credits back', '返回結算', 0, 0, 220, 72, new Color(255, 205, 74), new Color(91, 57, 31), 28, this.onHideCredits);
+        this.creditsBack = this.makeButton(credits, 'Credits back', '◀ 返回', 0, 0, 160, 64, new Color(255, 205, 74), new Color(91, 57, 31), 28, this.onHideCredits);
         credits.active = false;
 
         // Letterbox bars sit above the credits so the roll slides under them like a cinema screen.
@@ -1366,6 +1370,7 @@ export class FarmGame extends Component {
 
     private onShowLadder (): void {
         if (this.state === 'playing' || typeof document === 'undefined') return;
+        this.setVolumeOpen(false);
         const week = ladderWeek();
         this.ladderStore.top(week, this.player?.id ?? null)
             .then((entries) => this.ladderOverlay.showLadder(entries, this.player, this.ladderStore.shared, () => this.onRename()))
@@ -1583,21 +1588,29 @@ export class FarmGame extends Component {
             this.hudDrop = 2 * iconHalf + 6;
         }
         this.hud?.setPosition(hudX, size.height / 2 - 82 - this.hudDrop, 0);
+        // On a narrow screen the sliders open below the HUD instead of on top of it.
+        this.volumeBodyY = this.hudDrop > 0 ? (-82 - this.hudDrop - 54 * hudScale - 24 * vs) / vs : -90;
+        this.volumeBody?.setPosition(28 - 165, this.volumeBodyY, 0);
         this.volumePanel?.setPosition(panelX, panelY, 0);
         const fs = this.portrait ? 1.5 : 1;
         this.fpsButton?.setScale(fs, fs, 1);
         this.fpsButton?.setPosition(size.width / 2 - 66 * fs + 12 * (fs - 1), -size.height / 2 + 30 * fs, 0);
         const overlayScale = Math.min(1, (size.width - 28) / 610, (size.height - 36) / 440);
         this.overlay?.setScale(overlayScale, overlayScale, 1);
-        if (this.overlay) this.overlay.setPosition(0, 0, 0);
+        if (this.overlay) this.overlay.setPosition(0, this.portrait ? -size.height * 0.14 : 0, 0);
         this.drawCurtain(size.width, size.height);
-        const resultScale = Math.min(1, (size.width - 28) / 760, (size.height - 60) / 560);
+        // Results: buttons sit side by side on a wide screen and stack on a phone so everything can be larger.
+        const resultScale = this.portrait
+            ? Math.min(1.3, (size.width - 40) / 520, (size.height - 120) / 700)
+            : Math.min(1, (size.width - 28) / 760, (size.height - 60) / 600);
         this.resultPanel?.setScale(resultScale, resultScale, 1);
+        this.resultPanel?.setPosition(0, (this.portrait ? 80 : 20) * resultScale, 0);
+        this.replayButton?.setPosition(this.portrait ? 0 : -185, this.portrait ? -246 : -236, 0);
+        this.creditsButton?.setPosition(this.portrait ? 0 : 185, this.portrait ? -370 : -236, 0);
         const creditScale = this.portrait ? Math.min(1.2, (size.width - 28) / 520) : Math.min(1, (size.width - 28) / 900);
         this.creditsPanel?.setScale(creditScale, creditScale, 1);
-        // Landscape: top-left. Portrait: bottom-centre, because the volume panel already fills the top on a narrow screen.
-        if (this.portrait) this.creditsBack?.setPosition(0, -(size.height / 2) / creditScale + 120, 0);
-        else this.creditsBack?.setPosition(-(size.width / 2) / creditScale + 150, (size.height / 2) / creditScale - 125, 0);
+        // Back button stays top-left in both layouts; the music and ladder icons are hidden on this page.
+        this.creditsBack?.setPosition(-(size.width / 2) / creditScale + 110, (size.height / 2) / creditScale - 120, 0);
         this.refreshHud();
     }
 
@@ -1656,6 +1669,7 @@ export class FarmGame extends Component {
         this.resultHatched!.string = `🐣 本局孵化　${this.hatched} 隻小雞`;
         this.resultScore!.string = `⭐ 農場總分　${this.score} 分`;
         if (this.trophyIcon) this.trophyIcon.active = true;
+        this.setVolumeOpen(false);
         this.submitScore();
         this.resultPanel!.active = true;
         this.creditsPanel!.active = false;
@@ -2228,7 +2242,7 @@ export class FarmGame extends Component {
             const vs = this.volumeScale;
             if (Math.abs(uiX - x) < 34 * vs && Math.abs(uiY - y) < 34 * vs) return true;
             if (this.trophyIcon?.active && Math.abs(uiX - (x - 68 * vs)) < 34 * vs && Math.abs(uiY - y) < 34 * vs) return true;
-            if (this.volumeOpen && Math.abs(uiX - (x - 137 * vs)) < 175 * vs && Math.abs(uiY - (y - 90 * vs)) < 62 * vs) return true;
+            if (this.volumeOpen && Math.abs(uiX - (x - 137 * vs)) < 175 * vs && Math.abs(uiY - (y + this.volumeBodyY * vs)) < 62 * vs) return true;
         }
         return false;
     }
@@ -2242,14 +2256,19 @@ export class FarmGame extends Component {
 
     /** Live-stream style "+100": the hatch message itself floats up from the bottom-right corner, sways, and slowly fades away. */
     private floatHeart (): void {
+        this.pendingFloats++;
+    }
+
+    /** Hatches that land together share one floating line ("+300") instead of piling up unreadably. */
+    private spawnFloat (count: number): void {
         if (!this.heartRoot) return;
         if (this.hearts.length >= MAX_HEARTS) this.removeHeart(this.hearts[0]);
         const size = view.getVisibleSize();
-        const fontSize = 28 + Math.random() * 8;
+        const fontSize = Math.min(40, 28 + Math.random() * 4 + count * 1.5);
         const node = new Node('Hatch score');
         node.layer = Layers.Enum.UI_2D;
         this.heartRoot.addChild(node);
-        node.addComponent(UITransform).setContentSize(260, fontSize * 1.5);
+        node.addComponent(UITransform).setContentSize(320, fontSize * 1.5);
         const opacity = node.addComponent(UIOpacity);
         const label = node.addComponent(Label);
         label.useSystemFont = true;
@@ -2258,12 +2277,12 @@ export class FarmGame extends Component {
         label.lineHeight = Math.round(fontSize * 1.3);
         label.isBold = true;
         label.color = new Color(SCORE_FLOAT_COLORS[Math.floor(Math.random() * SCORE_FLOAT_COLORS.length)]);
-        label.string = SCORE_FLOAT_TEXT;
+        label.string = `孵化成功 +${POINTS_PER_CHICK * count}`;
         const outline = node.addComponent(LabelOutline);
         outline.color = new Color(40, 90, 60, 255);
         outline.width = 3;
         // Right-aligned lane near the edge; each one drifts a little differently like a live-stream reaction.
-        const startX = size.width / 2 - 150 - Math.random() * 40;
+        const startX = size.width / 2 - 170 - Math.random() * 30;
         const startY = -size.height / 2 + 90;
         node.setPosition(startX, startY, 0);
         node.setScale(0, 0, 1);
@@ -2275,6 +2294,12 @@ export class FarmGame extends Component {
     }
 
     private updateHearts (deltaTime: number): void {
+        this.floatCooldown -= deltaTime;
+        if (this.pendingFloats > 0 && this.floatCooldown <= 0) {
+            this.spawnFloat(this.pendingFloats);
+            this.pendingFloats = 0;
+            this.floatCooldown = 0.45;
+        }
         for (const heart of this.hearts.slice()) {
             heart.age += deltaTime;
             const t = heart.age / heart.life;
@@ -2298,6 +2323,7 @@ export class FarmGame extends Component {
     }
 
     private clearHearts (): void {
+        this.pendingFloats = 0;
         this.hearts.slice().forEach((heart) => this.removeHeart(heart));
     }
 
