@@ -1750,8 +1750,8 @@ export class FarmGame extends Component {
     }
 
     private henLayEgg (): void {
-        if (!this.hen || this.keyEggCooldown > 0) return;
-        this.keyEggCooldown = KEY_EGG_COOLDOWN;
+        // No cooldown: every tap, click or key press lays an egg (held keys do not auto-repeat).
+        if (!this.hen) return;
         const p = this.hen.position;
         // Lay just behind the hen so she doesn't stand on the egg.
         const angle = this.hen.eulerAngles.y * Math.PI / 180;
