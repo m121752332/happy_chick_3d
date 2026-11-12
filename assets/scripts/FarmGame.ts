@@ -78,8 +78,6 @@ const DESIGN_HEIGHT_PORTRAIT = 1136;
 
 /** Walkable ground: z range plus a half-width that can grow from front (maxZ) to back (minZ), so a perspective view fills a trapezoid. */
 interface FarmBounds { minX: number; maxX: number; minZ: number; maxZ: number; topHalfX: number; bottomHalfX: number }
-/** Eggs plus chicks allowed on the farm at once. */
-const MAX_CHICKS = 120;
 const CURTAIN_DROP_SECONDS = 0.9;
 const CURTAIN_LIFT_SECONDS = 0.7;
 const CREDITS_SPEED = 95;
@@ -1291,10 +1289,6 @@ export class FarmGame extends Component {
     }
 
     private layEgg (x: number, z: number): void {
-        if (this.chicks.length + this.eggs.length >= MAX_CHICKS) {
-            this.showToast('農場太熱鬧啦！等小雞長大再來下蛋。');
-            return;
-        }
         this.spawnEgg(x, z);
         this.audio.cluck();
     }
