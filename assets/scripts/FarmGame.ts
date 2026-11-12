@@ -362,6 +362,337 @@ class GameAudio {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Weekly ladder (天梯): player name, week math, score store and a DOM panel.
+// ---------------------------------------------------------------------------
+
+/**
+ * Shared weekly ladder on Supabase (free tier). Fill in the project URL and the public "anon" / publishable key
+ * from Project Settings → API. Leave them empty to keep scores on this device only.
+ * The key is meant to be public: the database only allows the three functions in supabase/ladder.sql.
+ */
+const SUPABASE_URL = 'https://xnjlyrnvzicdlyrqrpjh.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_5c7Aah4hiB8nWQGYWmctww_ThipVOHl';
+const PLAYER_STORAGE_KEY = 'happy-chick-player';
+const LADDER_STORAGE_KEY = 'happy-chick-ladder';
+/** Records kept per week. */
+const LADDER_MAX_RECORDS = 1000;
+/** Rows drawn in the panel. */
+const LADDER_SHOW_ROWS = 100;
+/** Name width: a CJK character counts 2, a letter or digit 1. 12 = six Chinese characters. */
+const NAME_MAX_WIDTH = 12;
+const DAY_MS = 86400000;
+/** The week starts Monday 06:00 Taipei time (UTC+8), i.e. Sunday 22:00 UTC. */
+const WEEK_SHIFT_MS = (8 - 6) * 3600000;
+
+const NAME_ADJECTIVES = [
+    '快樂', '愛睡', '勇敢', '害羞', '貪吃', '閃亮', '飛快', '溫柔', '調皮', '迷糊',
+    '超萌', '神氣', '開心', '安靜', '好奇', '熱情', '帥氣', '可愛', '酷酷', '暖暖',
+    '圓滾', '蓬鬆', '金黃', '粉紅', '天藍', '彩虹', '星星', '月光', '晨光', '微風',
+    '跳跳', '咕咕', '啾啾', '嘰嘰', '小小', '大大', '胖胖', '瘦瘦', '早起', '夜貓',
+];
+const NAME_CHARACTERS = [
+    '小雞', '母雞', '蛋蛋', '雞仔', '雞寶', '公雞', '雞腿', '布丁', '麻糬', '湯圓',
+    '鬆餅', '饅頭', '豆花', '芋圓', '奶茶', '玉米', '稻草', '農夫', '牧場主', '雞蛋糕',
+    '小黃', '咕嚕', '啾比', '嘰咪', '蛋黃', '雞米花', '小羽', '小冠', '阿雞', '雞大王',
+];
+/** Very small word filter: matches are replaced with "…". */
+const NAME_BLOCKLIST = ['幹', '靠北', '機掰', '雞掰', '白癡', '智障', '去死', 'fuck', 'shit', 'bitch'];
+
+interface LadderPlayer { id: string; name: string }
+interface LadderEntry { id: string; name: string; score: number; hatched: number; at: number; rank?: number }
+
+function charWidth (ch: string): number {
+    const code = ch.codePointAt(0) ?? 0;
+    return code > 0x2e7f ? 2 : 1;
+}
+
+/** Trim to NAME_MAX_WIDTH units, mask blocked words, add "…" when cut. 我是吉依卡哇啦 → 我是吉依卡哇… */
+function fitName (raw: string): string {
+    let name = (raw || '').replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim();
+    for (const word of NAME_BLOCKLIST) {
+        name = name.replace(new RegExp(word, 'gi'), '…');
+    }
+    let width = 0;
+    let out = '';
+    for (const ch of Array.from(name)) {
+        const w = charWidth(ch);
+        if (width + w > NAME_MAX_WIDTH) return out + '…';
+        width += w;
+        out += ch;
+    }
+    return out;
+}
+
+function randomName (): string {
+    const a = NAME_ADJECTIVES[Math.floor(Math.random() * NAME_ADJECTIVES.length)];
+    const c = NAME_CHARACTERS[Math.floor(Math.random() * NAME_CHARACTERS.length)];
+    return fitName(a + c);
+}
+
+function randomId (): string {
+    const c = typeof crypto !== 'undefined' ? crypto : null;
+    if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+    return 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+}
+
+/** Week number that flips every Monday 06:00 Taipei time. */
+function ladderWeek (now = Date.now()): number {
+    const day = Math.floor((now + WEEK_SHIFT_MS) / DAY_MS);
+    // 1970-01-01 was a Thursday; +3 makes Monday the first day of a week.
+    return Math.floor((day + 3) / 7);
+}
+
+function ladderWeekStart (week: number): number {
+    return (week * 7 - 3) * DAY_MS - WEEK_SHIFT_MS;
+}
+
+function loadPlayer (): LadderPlayer | null {
+    try {
+        const saved = JSON.parse(localStorage.getItem(PLAYER_STORAGE_KEY) ?? 'null');
+        if (saved && typeof saved.id === 'string' && typeof saved.name === 'string') return { id: saved.id, name: fitName(saved.name) };
+    } catch { /* storage blocked */ }
+    return null;
+}
+
+function savePlayer (player: LadderPlayer): void {
+    try { localStorage.setItem(PLAYER_STORAGE_KEY, JSON.stringify(player)); } catch { /* storage blocked */ }
+}
+
+/** Where scores live. The local store keeps this device's results; a cloud store can replace it later. */
+interface LadderStore {
+    readonly shared: boolean;
+    submit (week: number, entry: LadderEntry): Promise<void>;
+    /** Sorted rows; each carries its rank. The player's own row is included even outside the top rows. */
+    top (week: number, playerId: string | null): Promise<LadderEntry[]>;
+    rename (week: number, player: LadderPlayer): Promise<void>;
+}
+
+class LocalLadderStore implements LadderStore {
+    readonly shared = false;
+
+    private read (week: number): LadderEntry[] {
+        try {
+            const saved = JSON.parse(localStorage.getItem(LADDER_STORAGE_KEY) ?? 'null');
+            if (saved && saved.week === week && Array.isArray(saved.entries)) return saved.entries;
+        } catch { /* storage blocked */ }
+        return [];
+    }
+
+    async submit (week: number, entry: LadderEntry): Promise<void> {
+        const entries = this.read(week);
+        const mine = entries.find((e) => e.id === entry.id);
+        // One row per player per week: keep the best score, but always show the latest name.
+        if (mine) {
+            mine.name = entry.name;
+            if (entry.score > mine.score) { mine.score = entry.score; mine.hatched = entry.hatched; mine.at = entry.at; }
+        } else {
+            entries.push(entry);
+        }
+        entries.sort((a, b) => b.score - a.score || a.at - b.at);
+        entries.length = Math.min(entries.length, LADDER_MAX_RECORDS);
+        try { localStorage.setItem(LADDER_STORAGE_KEY, JSON.stringify({ week, entries })); } catch { /* storage blocked */ }
+    }
+
+    async top (week: number, _playerId: string | null): Promise<LadderEntry[]> {
+        return this.read(week).map((e, i) => ({ ...e, rank: i + 1 }));
+    }
+
+    async rename (week: number, player: LadderPlayer): Promise<void> {
+        const entries = this.read(week);
+        const mine = entries.find((e) => e.id === player.id);
+        if (!mine) return;
+        mine.name = player.name;
+        try { localStorage.setItem(LADDER_STORAGE_KEY, JSON.stringify({ week, entries })); } catch { /* storage blocked */ }
+    }
+}
+
+/** Calls the database functions in supabase/ladder.sql over Supabase's REST API (no SDK needed). */
+class SupabaseLadderStore implements LadderStore {
+    readonly shared = true;
+    private local = new LocalLadderStore();
+
+    constructor (private url: string, private key: string) {}
+
+    private async rpc<T> (fn: string, body: Record<string, unknown>): Promise<T> {
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = setTimeout(() => controller?.abort(), 8000);
+        try {
+            const res = await fetch(`${this.url.replace(/\/$/, '')}/rest/v1/rpc/${fn}`, {
+                method: 'POST',
+                // New sb_publishable_ keys go in apikey only; legacy anon JWT keys are also sent as a bearer token.
+                headers: this.key.startsWith('eyJ')
+                    ? { apikey: this.key, Authorization: `Bearer ${this.key}`, 'Content-Type': 'application/json' }
+                    : { apikey: this.key, 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: controller?.signal,
+            });
+            if (!res.ok) throw new Error(`${fn} ${res.status}`);
+            const text = await res.text();
+            return (text ? JSON.parse(text) : null) as T;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    async submit (week: number, entry: LadderEntry): Promise<void> {
+        // Keep a copy on the device too, so an offline round still shows up locally.
+        await this.local.submit(week, entry);
+        await this.rpc('submit_score', { p_player: entry.id, p_name: entry.name, p_score: entry.score, p_hatched: entry.hatched });
+    }
+
+    async top (_week: number, playerId: string | null): Promise<LadderEntry[]> {
+        const rows = await this.rpc<{ rank: number; name: string; score: number; hatched: number; is_me: boolean }[]>(
+            'get_ladder', { p_player: playerId, p_limit: LADDER_SHOW_ROWS });
+        return (rows || []).map((r) => ({
+            id: r.is_me && playerId ? playerId : `rank-${r.rank}`,
+            name: r.name,
+            score: r.score,
+            hatched: r.hatched,
+            at: 0,
+            rank: r.rank,
+        }));
+    }
+
+    async rename (week: number, player: LadderPlayer): Promise<void> {
+        await this.local.rename(week, player);
+        await this.rpc('rename_player', { p_player: player.id, p_name: player.name });
+    }
+}
+
+function escapeHtml (text: string): string {
+    return text.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string, string>)[c]);
+}
+
+/** HTML overlays for the name prompt and the ladder: native text input handles Chinese IME and scrolling. */
+class LadderOverlay {
+    private root: HTMLDivElement | null = null;
+    onClose: (() => void) | null = null;
+
+    get open (): boolean { return !!this.root; }
+
+    private mount (html: string): HTMLDivElement {
+        this.close(false);
+        if (!document.getElementById('hc-ladder-style')) {
+            const style = document.createElement('style');
+            style.id = 'hc-ladder-style';
+            style.textContent = `
+.hc-mask{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;background:rgba(10,24,36,.55);cursor:auto;font-family:"PingFang TC","Microsoft JhengHei","Noto Sans TC",sans-serif;padding:16px;box-sizing:border-box}
+.hc-card{width:min(440px,100%);max-height:min(640px,calc(100vh - 32px));display:flex;flex-direction:column;background:#163246;color:#fff6d2;border-radius:22px;box-shadow:0 10px 0 rgba(0,0,0,.25);padding:20px 20px 16px;box-sizing:border-box}
+.hc-card h2{margin:0 0 4px;font-size:26px;text-align:center;color:#ffd666}
+.hc-sub{margin:0 0 14px;text-align:center;font-size:14px;opacity:.8}
+.hc-row{display:flex;gap:8px}
+.hc-input{flex:1;min-width:0;font-size:20px;padding:10px 12px;border-radius:12px;border:3px solid #ffd666;background:#fffaf0;color:#5b391f;outline:none;font-family:inherit}
+.hc-btn{font-size:18px;font-family:inherit;border:0;border-radius:14px;padding:10px 16px;cursor:pointer;background:#ffcc4a;color:#5b391f;font-weight:600;box-shadow:0 4px 0 rgba(0,0,0,.25);white-space:nowrap}
+.hc-btn:active{transform:translateY(2px);box-shadow:0 2px 0 rgba(0,0,0,.25)}
+.hc-btn.alt{background:#7cc8ec;color:#163246}
+.hc-btn.ghost{background:rgba(255,255,255,.15);color:#fff6d2}
+.hc-preview{margin:10px 2px 16px;font-size:15px;opacity:.85;min-height:20px}
+.hc-actions{display:flex;gap:10px;justify-content:center;margin-top:12px}
+.hc-list{flex:1;overflow-y:auto;margin:0 -6px;padding:0 6px;-webkit-overflow-scrolling:touch}
+.hc-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:12px;font-size:17px}
+.hc-item:nth-child(odd){background:rgba(255,255,255,.06)}
+.hc-item.me{background:rgba(255,214,102,.28);outline:2px solid #ffd666}
+.hc-rank{width:44px;text-align:center;font-weight:700;color:#ffd666}
+.hc-name{flex:1;min-width:0;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hc-score{font-variant-numeric:tabular-nums;font-weight:600}
+.hc-mine{margin-top:10px}
+.hc-empty{text-align:center;padding:30px 0;opacity:.75}
+.hc-note{font-size:12px;opacity:.6;text-align:center;margin-top:8px}`;
+            document.head.appendChild(style);
+        }
+        const root = document.createElement('div');
+        root.className = 'hc-mask';
+        root.innerHTML = `<div class="hc-card">${html}</div>`;
+        // Keep taps and keys inside the overlay away from the game.
+        for (const type of ['pointerdown', 'mousedown', 'touchstart', 'mousemove', 'touchmove']) {
+            root.addEventListener(type, (e) => e.stopPropagation());
+        }
+        document.body.appendChild(root);
+        this.root = root;
+        return root;
+    }
+
+    close (notify = true): void {
+        if (!this.root) return;
+        this.root.remove();
+        this.root = null;
+        if (notify) this.onClose?.();
+    }
+
+    /** First-visit (or rename) prompt: type a name or roll a random one. */
+    askName (current: string | null, onDone: (name: string) => void): void {
+        const first = !current;
+        const root = this.mount(`
+<h2>${first ? '歡迎來到快樂小雞農場！' : '修改名字'}</h2>
+<p class="hc-sub">幫自己取個名字，上天梯排行榜用（中文最多 6 個字）</p>
+<div class="hc-row"><input class="hc-input" maxlength="40" placeholder="輸入名字…"><button class="hc-btn alt" data-act="dice" title="隨機名字">🎲</button></div>
+<div class="hc-preview"></div>
+<div class="hc-actions">${first ? '' : '<button class="hc-btn ghost" data-act="cancel">取消</button>'}<button class="hc-btn" data-act="ok">確定</button></div>`);
+        const input = root.querySelector('input') as HTMLInputElement;
+        const preview = root.querySelector('.hc-preview') as HTMLDivElement;
+        input.value = current ?? randomName();
+        const refresh = (): void => {
+            const fitted = fitName(input.value);
+            preview.textContent = fitted ? `排行榜上會顯示：${fitted}` : '名字不能空白，可以按 🎲 隨機產生';
+        };
+        refresh();
+        input.addEventListener('input', refresh);
+        const confirm = (): void => {
+            const fitted = fitName(input.value) || randomName();
+            this.close(false);
+            onDone(fitted);
+            this.onClose?.();
+        };
+        input.addEventListener('keydown', (e) => {
+            e.stopPropagation();
+            if (e.key === 'Enter' && !e.isComposing) confirm();
+        });
+        root.addEventListener('click', (e) => {
+            const act = (e.target as HTMLElement).closest('[data-act]')?.getAttribute('data-act');
+            if (act === 'dice') { input.value = randomName(); refresh(); }
+            if (act === 'ok') confirm();
+            if (act === 'cancel') this.close();
+        });
+        setTimeout(() => { input.focus(); input.select(); }, 50);
+    }
+
+    /** The weekly ladder: top rows, the player's own rank and the reset countdown. */
+    showLadder (entries: LadderEntry[], me: LadderPlayer | null, shared: boolean, onRename: () => void): void {
+        const week = ladderWeek();
+        const left = ladderWeekStart(week + 1) - Date.now();
+        const days = Math.floor(left / DAY_MS);
+        const hours = Math.floor((left % DAY_MS) / 3600000);
+        const minutes = Math.floor((left % 3600000) / 60000);
+        const countdown = days > 0 ? `${days} 天 ${hours} 小時` : `${hours} 小時 ${minutes} 分`;
+        const row = (e: LadderEntry, rank: number): string => {
+            const medal = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : String(rank);
+            const mine = me && e.id === me.id ? ' me' : '';
+            return `<div class="hc-item${mine}"><span class="hc-rank">${medal}</span><span class="hc-name">${escapeHtml(fitName(e.name))}</span><span class="hc-score">${e.score.toLocaleString()} 分</span></div>`;
+        };
+        const rankOf = (e: LadderEntry, i: number): number => e.rank ?? i + 1;
+        const shown = entries.filter((e, i) => rankOf(e, i) <= LADDER_SHOW_ROWS);
+        const myIndex = me ? entries.findIndex((e) => e.id === me.id) : -1;
+        const myRank = myIndex >= 0 ? rankOf(entries[myIndex], myIndex) : -1;
+        const mineRow = myRank > LADDER_SHOW_ROWS ? `<div class="hc-mine">${row(entries[myIndex], myRank)}</div>` : '';
+        const status = myRank > 0 ? `你目前第 ${myRank} 名` : '本週還沒有你的成績，玩一局就上榜！';
+        const root = this.mount(`
+<h2>🏆 本週天梯</h2>
+<p class="hc-sub">每週一早上 6:00 重新排名，距離刷新還有 ${countdown}<br>${me ? escapeHtml(me.name) + '，' : ''}${escapeHtml(status)}</p>
+<div class="hc-list">${shown.length ? shown.map((e, i) => row(e, rankOf(e, i))).join('') : '<div class="hc-empty">本週還沒有人上榜</div>'}</div>
+${mineRow}
+<div class="hc-actions"><button class="hc-btn ghost" data-act="rename">✏️ 改名</button><button class="hc-btn" data-act="close">關閉</button></div>
+${shared ? '' : '<div class="hc-note">目前是本機紀錄，只會顯示這台裝置上的成績</div>'}`);
+        root.addEventListener('click', (e) => {
+            const target = e.target as HTMLElement;
+            if (target === root) { this.close(); return; }
+            const act = target.closest('[data-act]')?.getAttribute('data-act');
+            if (act === 'close') this.close();
+            if (act === 'rename') onRename();
+        });
+    }
+}
+
 @ccclass('FarmGame')
 export class FarmGame extends Component {
     private state: GameState = 'ready';
@@ -428,6 +759,11 @@ export class FarmGame extends Component {
     private readonly keys = new Set<string>();
     private volumePanel: Node | null = null;
     private volumeBody: Node | null = null;
+    private trophyIcon: Node | null = null;
+    private ladderStore: LadderStore = SUPABASE_URL && SUPABASE_ANON_KEY ? new SupabaseLadderStore(SUPABASE_URL, SUPABASE_ANON_KEY) : new LocalLadderStore();
+    private ladderOverlay = new LadderOverlay();
+    private player: LadderPlayer | null = null;
+    private resultRank: Label | null = null;
     private volumeOpen = false;
     private hudDrop = 0;
     private fpsButton: Node | null = null;
@@ -460,6 +796,7 @@ export class FarmGame extends Component {
         this.buildUI();
         this.installHenCursor();
         this.buildHen();
+        this.setupPlayer();
         if (typeof document !== 'undefined') {
             document.addEventListener('pointerdown', this.unlockAudio);
             document.addEventListener('keydown', this.unlockAudio);
@@ -904,6 +1241,7 @@ export class FarmGame extends Component {
         this.makeHenBadge(badge, 1.1);
         this.resultHatched = this.makeLabel(results, 'Result hatched', '', 36, new Color(255, 243, 200), 0, -40, 700, 52);
         this.resultScore = this.makeLabel(results, 'Result score', '', 36, new Color(255, 243, 200), 0, -92, 700, 52);
+        this.resultRank = this.makeLabel(results, 'Result rank', '', 26, new Color(255, 214, 102), 0, -128, 700, 36);
         this.makeButton(results, 'Replay button', '再玩一次　▶', -185, -210, 340, 104, new Color(255, 205, 74), new Color(91, 57, 31), 36, this.onReplay);
         this.makeButton(results, 'Credits button', '製作團隊　🎬', 185, -210, 340, 104, new Color(120, 205, 235), new Color(20, 52, 74), 36, this.onShowCredits);
 
@@ -988,6 +1326,59 @@ export class FarmGame extends Component {
         this.animateY(this.curtain, 0, height, CURTAIN_LIFT_SECONDS, () => {
             this.curtain!.active = false;
             this.startRound();
+        });
+    }
+
+    /** First visit: ask for a name (or roll a random one) and remember it with a private player id. */
+    private setupPlayer (): void {
+        if (typeof document === 'undefined') return;
+        this.player = loadPlayer();
+        this.ladderOverlay.onClose = () => this.updateCursor(0, 0);
+        if (!this.player) {
+            this.ladderOverlay.askName(null, (name) => {
+                this.player = { id: randomId(), name };
+                savePlayer(this.player);
+            });
+        }
+    }
+
+    private submitScore (): void {
+        if (this.resultRank) this.resultRank.string = '';
+        if (!this.player || this.score <= 0) return;
+        const week = ladderWeek();
+        const player = this.player;
+        const entry: LadderEntry = { id: player.id, name: player.name, score: this.score, hatched: this.hatched, at: Date.now() };
+        this.ladderStore.submit(week, entry)
+            .then(() => this.ladderStore.top(week, player.id))
+            .then((entries) => {
+                const index = entries.findIndex((e) => e.id === player.id);
+                if (index < 0 || !this.resultRank || this.state !== 'ended') return;
+                const rank = entries[index].rank ?? index + 1;
+                const best = entries[index].score;
+                this.resultRank.string = best > this.score
+                    ? `🏆 本週第 ${rank} 名（最佳 ${best} 分）`
+                    : `🏆 本週天梯第 ${rank} 名！`;
+            })
+            .catch(() => {
+                if (this.resultRank && this.state === 'ended') this.resultRank.string = '🏆 排行榜連線失敗，成績先記在這台裝置';
+            });
+    }
+
+    private onShowLadder (): void {
+        if (this.state === 'playing' || typeof document === 'undefined') return;
+        const week = ladderWeek();
+        this.ladderStore.top(week, this.player?.id ?? null)
+            .then((entries) => this.ladderOverlay.showLadder(entries, this.player, this.ladderStore.shared, () => this.onRename()))
+            .catch(() => this.showToast('排行榜暫時連不上，稍後再試試。'));
+    }
+
+    private onRename (): void {
+        this.ladderOverlay.askName(this.player?.name ?? null, (name) => {
+            this.player = { id: this.player?.id ?? randomId(), name };
+            savePlayer(this.player);
+            this.ladderStore.rename(ladderWeek(), this.player)
+                .catch(() => { /* the new name is used from the next round anyway */ })
+                .then(() => this.onShowLadder());
         });
     }
 
@@ -1185,7 +1576,8 @@ export class FarmGame extends Component {
         const hudHalf = 280 * hudScale;
         let hudX = 0;
         this.hudDrop = 0;
-        if (hudX + hudHalf > panelX - iconHalf - 10) hudX = panelX - iconHalf - 10 - hudHalf;
+        const iconsLeft = panelX - iconHalf - 68 * vs;
+        if (hudX + hudHalf > iconsLeft - 10) hudX = iconsLeft - 10 - hudHalf;
         if (hudX - hudHalf < -size.width / 2 + 10) {
             hudX = 0;
             this.hudDrop = 2 * iconHalf + 6;
@@ -1217,6 +1609,8 @@ export class FarmGame extends Component {
 
     private startRound (): void {
         this.state = 'playing';
+        if (this.trophyIcon) this.trophyIcon.active = false;
+        this.ladderOverlay.close(false);
         this.secondsLeft = ROUND_SECONDS;
         this.score = 0;
         this.hatched = 0;
@@ -1261,6 +1655,8 @@ export class FarmGame extends Component {
         this.resultTitle!.string = '時間到！';
         this.resultHatched!.string = `🐣 本局孵化　${this.hatched} 隻小雞`;
         this.resultScore!.string = `⭐ 農場總分　${this.score} 分`;
+        if (this.trophyIcon) this.trophyIcon.active = true;
+        this.submitScore();
         this.resultPanel!.active = true;
         this.creditsPanel!.active = false;
         if (this.volumePanel) this.volumePanel.active = true;
@@ -1304,6 +1700,8 @@ export class FarmGame extends Component {
     }
 
     private onDomKeyDown = (event: KeyboardEvent): void => {
+        // Typing a name or reading the ladder must not start or play the game.
+        if (this.ladderOverlay.open) return;
         const code = domKeyName(event);
         if (GAME_KEYS.indexOf(code) >= 0) event.preventDefault();
         if (event.repeat && this.keys.has(code)) return;
@@ -1433,6 +1831,32 @@ export class FarmGame extends Component {
         g.stroke();
         g.rect(0.5, 8, 14.5, 4);
         g.fill();
+        const trophy = this.makeButton(panel, 'Ladder icon', '', -68, 0, 56, 56, new Color(22, 50, 70, 225), new Color(255, 246, 210), 20, this.onShowLadder);
+        this.trophyIcon = trophy;
+        const cup = new Node('Trophy');
+        trophy.addChild(cup);
+        const t = cup.addComponent(Graphics);
+        const gold = new Color(255, 214, 102);
+        t.strokeColor = gold;
+        t.lineWidth = 3.5;
+        t.circle(-10, 7, 5.5);
+        t.stroke();
+        t.circle(10, 7, 5.5);
+        t.stroke();
+        t.fillColor = gold;
+        t.moveTo(-10, 15);
+        t.lineTo(10, 15);
+        t.lineTo(7, 1);
+        t.quadraticCurveTo(0, -5, -7, 1);
+        t.close();
+        t.fill();
+        t.rect(-2.5, -9, 5, 8);
+        t.fill();
+        t.roundRect(-9, -15, 18, 6, 2);
+        t.fill();
+        t.fillColor = new Color(22, 50, 70);
+        t.circle(0, 8, 2.6);
+        t.fill();
         const body = new Node('Volume body');
         panel.addChild(body);
         this.volumeBody = body;
@@ -1803,6 +2227,7 @@ export class FarmGame extends Component {
             const y = panel.position.y + size.height / 2;
             const vs = this.volumeScale;
             if (Math.abs(uiX - x) < 34 * vs && Math.abs(uiY - y) < 34 * vs) return true;
+            if (this.trophyIcon?.active && Math.abs(uiX - (x - 68 * vs)) < 34 * vs && Math.abs(uiY - y) < 34 * vs) return true;
             if (this.volumeOpen && Math.abs(uiX - (x - 137 * vs)) < 175 * vs && Math.abs(uiY - (y - 90 * vs)) < 62 * vs) return true;
         }
         return false;
